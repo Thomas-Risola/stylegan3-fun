@@ -44,13 +44,16 @@ def draw_mask(image):
 @click.command()
 @click.pass_context
 @click.option('--target', '-t', 'target_fname', type=click.Path(exists=True, dir_okay=False), help='input image to mask', required=True, metavar='FILE')
-@click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'experiences', 'out', 'mask'), show_default=True, metavar='DIR')
+@click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'experiences', 'mask'), show_default=True, metavar='DIR')
 def main(ctx: click.Context, target_fname: str, outdir: str):
-    file_name = target_fname.split("\\")[-1]
+    if "\\" in target_fname:
+        file_name = target_fname.split("\\")[-1]
+    else:
+        file_name = target_fname.split("/")[-1]
     image = cv2.imread(target_fname)  # Replace "input_image.jpg" with your image file path
     mask = draw_mask(image)
-    cv2.imwrite(outdir + file_name, np.round(mask*255))  # Save the mask as an image file
-    np.save(outdir + file_name[0:-4], mask)
+    cv2.imwrite(outdir + "/" + file_name, np.round(mask*255))  # Save the mask as an image file
+    np.save(outdir + "/" + file_name[0:-4], mask)
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,7 @@ import PIL.Image
 
 import torch
 import torch.nn.functional as F
+from torchvision import transforms
 
 import dnnlib
 from dnnlib.util import format_time
@@ -29,6 +30,7 @@ from metrics import metric_utils
 def project(
         G,
         target: PIL.Image.Image,  # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
+        mask,
         *,
         projection_seed: int,
         truncation_psi: float,
@@ -90,8 +92,14 @@ def project(
         target = np.array(target, dtype=np.uint8)
         target = torch.tensor(target.transpose([2, 0, 1]), device=device)
         target = target.unsqueeze(0).to(device).to(torch.float32)
+        mask = mask.unsqueeze(0).to(device).to(torch.float32)
+       
+
         if target.shape[2] > 256:
             target = F.interpolate(target, size=(256, 256), mode='area')
+            mask = F.interpolate(mask, size=(256, 256), mode='area')
+        # MASK AVANT TRANSFORMATION
+        target = target * (1-mask)
 
     if loss_paper in ['sgan2', 'im2sgan']:
         # Load the VGG16 feature detector.
@@ -101,6 +109,14 @@ def project(
     # Define the target features and possible new losses
     if loss_paper == 'sgan2':
         target_features = vgg16(target, resize_images=False, return_lpips=True)
+
+    elif loss_paper == 'global_mse':
+        target = np.array(target, dtype=np.uint8)
+        target = torch.tensor(target.transpose([2, 0, 1]), device=device)
+        target = target.unsqueeze(0).to(device).to(torch.float32)
+        mask = mask.unsqueeze(0).to(device).to(torch.float32)
+
+        mse = torch.nn.MSELoss(reduction='mean')
 
     elif loss_paper == 'im2sgan':
         # Use specific layers
@@ -161,16 +177,18 @@ def project(
             param_group['lr'] = lr
 
         # Synth images from opt_w.
+            
+        ratio_back_to_average = 0
         w_noise = torch.randn_like(w_opt) * w_noise_scale
         if project_in_wplus:
-            ws = w_opt + w_noise
+            ws = (w_opt + w_noise) # + w_avg*ratio_back_to_average)/(1+ratio_back_to_average)
         else:
             ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
         synth_images = G.synthesis(ws, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
         synth_images = (synth_images + 1) * (255/2)
-        if synth_images.shape[2] > 256:
+        if synth_images.shape[2] > 256 and loss_paper != "global_mse":
             synth_images = F.interpolate(synth_images, size=(256, 256), mode='area')
 
         # Reshape synthetic images if G was trained with grayscale data
@@ -179,7 +197,7 @@ def project(
 
         # Features for synth images.
         if loss_paper == 'sgan2':
-            synth_features = vgg16(synth_images, resize_images=False, return_lpips=True)
+            synth_features = vgg16(synth_images*(1-mask), resize_images=False, return_lpips=True)
             dist = (target_features - synth_features).square().sum()
 
             # Noise regularization.
@@ -200,6 +218,18 @@ def project(
 
             last_status = {'dist': dist.item(), 'loss': loss.item()}
 
+        elif loss_paper == 'global_mse':
+            
+            dist = ((synth_images - target)*(1-mask)/ (G.img_channels * G.img_resolution * G.img_resolution)).square().sum()
+
+            loss = 1000*dist
+            last_status = {'loss': loss.item()}
+
+            n_digits = int(np.log10(num_steps)) + 1 if num_steps > 0 else 1
+            message = f'step {step + 1:{n_digits}d}/{num_steps}: dist {dist:.7e} | loss {loss.item():.7e}'
+            print(message, end='\r')
+
+
         elif loss_paper == 'im2sgan':
             # Uncomment to also use LPIPS features as loss (must be better fine-tuned):
             # lpips_synth_features = vgg16(synth_images, resize_images=False, return_lpips=True)
@@ -211,7 +241,7 @@ def project(
             # percept_error += 1e1 * (lpips_target_features - lpips_synth_features).square().sum()
 
             # Pixel-level MSE
-            mse_error = mse(synth_images, target) / (G.img_channels * G.img_resolution * G.img_resolution)
+            mse_error = mse(synth_images, target) / (G.img_channels * G.img_resolution )
             ssim_loss = ssim_out(target, synth_images)  # tracking SSIM (can also be added the total loss)
             loss = percept_error + mse_error  # + 1e-2 * (1 - ssim_loss)  # needs to be fine-tuned
 
@@ -374,7 +404,7 @@ def project(
 @click.option('--projection-seed', type=int, help='Seed to start projection from', default=None, show_default=True)
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi to use in projection when using a projection seed', default=0.7, show_default=True)
 # Decide the loss to use when projecting (all other apart from o.g. StyleGAN2's are experimental, you can select the VGG16 features/layers to use in the im2sgan loss)
-@click.option('--loss-paper', '-loss', type=click.Choice(['sgan2', 'im2sgan', 'discriminator', 'clip']), help='Loss to use (if using "im2sgan", make sure to norm the VGG16 features)', default='sgan2', show_default=True)
+@click.option('--loss-paper', '-loss', type=click.Choice(['sgan2', 'im2sgan', 'discriminator', 'clip', 'global_mse']), help='Loss to use (if using "im2sgan", make sure to norm the VGG16 features)', default='sgan2', show_default=True)
 # im2sgan loss options (try with and without them, though I've found --vgg-normed to work best for me)
 @click.option('--vgg-normed', 'normed', is_flag=True, help='Add flag to norm the VGG16 features by the number of elements per layer that was used')
 @click.option('--vgg-sqrt-normed', 'sqrt_normed', is_flag=True, help='Add flag to norm the VGG16 features by the square root of the number of elements per layer that was used')
@@ -449,6 +479,21 @@ def run_projection(
     target_pil = target_pil.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
     target_uint8 = np.array(target_pil, dtype=np.uint8)
 
+    # Load target mask.
+    mask = np.load(mask_fname)
+    mask = PIL.Image.fromarray(mask)
+    w, h = mask.size
+    s = min(w, h)
+    mask = mask.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+    mask = mask.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
+    mask = np.array(mask, dtype=np.uint8)
+
+    # WE COULD ADD SOME ASSERT HERE FOR PRODUCTION CODE
+
+    transform = transforms.ToTensor()
+    mask_tensor = transform(mask) * 255
+    mask_tensor = mask_tensor.repeat(1, 3, 1, 1).round()
+
     # Stabilize the latent space to make things easier (for StyleGAN3's config t and r models)
     if stabilize_projection:
         gen_utils.anchor_latent_space(G)
@@ -458,6 +503,7 @@ def run_projection(
     projected_w_steps, run_config = project(
         G,
         target=target_pil,
+        mask=mask_tensor,
         num_steps=num_steps,
         initial_learning_rate=initial_learning_rate,
         constant_learning_rate=constant_learning_rate,
